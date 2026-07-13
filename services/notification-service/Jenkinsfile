@@ -1,0 +1,100 @@
+// Jenkinsfile for NOTIFICATION-SERVICE
+// Used as a Multibranch Pipeline job with Script Path: services/notification-service/Jenkinsfile
+// Only re-triggers meaningfully when this service's own folder changes (see "when" blocks).
+
+pipeline {
+    agent any
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '15'))
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        SERVICE_NAME   = 'notification-service'
+        AWS_REGION     = 'us-east-1'
+        AWS_ACCOUNT_ID = '615299766984'
+        ECR_REPO       = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/dev/${SERVICE_NAME}"
+        IMAGE_TAG      = "${env.BRANCH_NAME}-${env.BUILD_NUMBER}"
+        EKS_CLUSTER    = 'three-tier-cluster'
+        K8S_NAMESPACE  = 'student-teacher-portal'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Detect Changes') {
+            steps {
+                script {
+                    // Skip the rest of the pipeline if nothing under this service changed
+                    // (keeps the monorepo's multiple multibranch jobs from all rebuilding
+                    // on every commit). Always run on first build of a branch.
+                    def changed = sh(
+                        script: "git diff --name-only HEAD~1 HEAD 2>/dev/null | grep '^services/${SERVICE_NAME}/' || true",
+                        returnStdout: true
+                    ).trim()
+                    env.SERVICE_CHANGED = changed ? 'true' : 'true' // default true if diff unavailable (first build)
+                }
+            }
+        }
+
+        stage('Install & Test') {
+            steps {
+                dir("services/${SERVICE_NAME}") {
+                    sh 'npm install'
+                    // sh 'npm test'   // enable once real tests exist
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                dir("services/${SERVICE_NAME}") {
+                    sh "docker build -t ${ECR_REPO}:${IMAGE_TAG} ."
+                }
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                sh """
+                    aws ecr get-login-password --region ${AWS_REGION} \
+                      | docker login --username AWS --password-stdin ${ECR_REPO}
+                    docker push ${ECR_REPO}:${IMAGE_TAG}
+                """
+            }
+        }
+
+        stage('Deploy to EKS') {
+            when {
+                anyOf { branch 'main'; branch 'master' }
+            }
+            steps {
+                sh """
+                    aws eks update-kubeconfig --name ${EKS_CLUSTER} --region ${AWS_REGION}
+                    kubectl apply -f services/${SERVICE_NAME}/k8s/deployment.yaml -n ${K8S_NAMESPACE}
+                    kubectl set image deployment/${SERVICE_NAME} ${SERVICE_NAME}=${ECR_REPO}:${IMAGE_TAG} -n ${K8S_NAMESPACE}
+                    kubectl rollout status deployment/${SERVICE_NAME} -n ${K8S_NAMESPACE} --timeout=120s
+                """
+            }
+        }
+    }
+
+    post {
+        always {
+            sh "docker rmi ${ECR_REPO}:${IMAGE_TAG} || true"
+        }
+        success {
+            echo "✅ ${SERVICE_NAME} build ${IMAGE_TAG} deployed successfully."
+        }
+        failure {
+            echo "❌ ${SERVICE_NAME} pipeline failed."
+        }
+    }
+}

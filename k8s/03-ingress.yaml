@@ -1,0 +1,24 @@
+# Requires the AWS Load Balancer Controller to be installed on the cluster.
+# All traffic goes to the frontend Service; the frontend's nginx.conf does the
+# internal routing to student-service / teacher-service (see frontend/nginx.conf).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: student-teacher-portal-ingress
+  namespace: student-teacher-portal
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/healthcheck-path: /
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80

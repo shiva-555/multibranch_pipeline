@@ -1,0 +1,87 @@
+// Jenkinsfile for FRONTEND
+// Used as a Multibranch Pipeline job with Script Path: frontend/Jenkinsfile
+
+pipeline {
+    agent any
+
+    options {
+        buildDiscarder(logRotator(numToKeepStr: '15'))
+        timestamps()
+        disableConcurrentBuilds()
+    }
+
+    environment {
+        SERVICE_NAME   = 'frontend'
+        AWS_REGION     = 'us-east-1'
+        AWS_ACCOUNT_ID = '615299766984'
+        ECR_REPO       = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/dev/${SERVICE_NAME}"
+        IMAGE_TAG      = "${env.BRANCH_NAME}-${env.BUILD_NUMBER}"
+        EKS_CLUSTER    = 'three-tier-cluster'
+        K8S_NAMESPACE  = 'student-teacher-portal'
+        // Frontend calls the backend via nginx's relative "/api" proxy (see nginx.conf),
+        // which fans out to student-service / teacher-service inside the cluster.
+        REACT_APP_API_BASE_URL = '/api'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Install & Test') {
+            steps {
+                dir('frontend') {
+                    sh 'npm install'
+                    // sh 'CI=true npm test'   // enable once real tests exist
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                dir('frontend') {
+                    sh "docker build --build-arg REACT_APP_API_BASE_URL=${REACT_APP_API_BASE_URL} -t ${ECR_REPO}:${IMAGE_TAG} ."
+                }
+            }
+        }
+
+        stage('Push to ECR') {
+            steps {
+                sh """
+                    aws ecr get-login-password --region ${AWS_REGION} \
+                      | docker login --username AWS --password-stdin ${ECR_REPO}
+                    docker push ${ECR_REPO}:${IMAGE_TAG}
+                """
+            }
+        }
+
+        stage('Deploy to EKS') {
+            when {
+                anyOf { branch 'main'; branch 'master' }
+            }
+            steps {
+                sh """
+                    aws eks update-kubeconfig --name ${EKS_CLUSTER} --region ${AWS_REGION}
+                    kubectl apply -f frontend/k8s/deployment.yaml -n ${K8S_NAMESPACE}
+                    kubectl set image deployment/frontend frontend=${ECR_REPO}:${IMAGE_TAG} -n ${K8S_NAMESPACE}
+                    kubectl rollout status deployment/frontend -n ${K8S_NAMESPACE} --timeout=120s
+                """
+            }
+        }
+    }
+
+    post {
+        always {
+            sh "docker rmi ${ECR_REPO}:${IMAGE_TAG} || true"
+        }
+        success {
+            echo "✅ frontend build ${IMAGE_TAG} deployed successfully."
+        }
+        failure {
+            echo "❌ frontend pipeline failed."
+        }
+    }
+}

@@ -1,0 +1,116 @@
+version: '3.9'
+
+services:
+  db:
+    container_name: mysql-container
+    image: mysql:8.0.40-oraclelinux9
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: mysql123
+      MYSQL_DATABASE: school
+    volumes:
+      - mysql-data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-pmysql123"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---- Microservice: Student ----
+  student-service:
+    container_name: student-service
+    build:
+      context: services/student-service
+    image: student-service-image
+    restart: always
+    ports:
+      - "3501:3501"
+    environment:
+      host: db
+      user: root
+      password: mysql123
+      database: school   # same shared database as teacher-service
+      PORT: 3501
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ---- Microservice: Teacher ----
+  teacher-service:
+    container_name: teacher-service
+    build:
+      context: services/teacher-service
+    image: teacher-service-image
+    restart: always
+    ports:
+      - "3502:3502"
+    environment:
+      host: db
+      user: root
+      password: mysql123
+      database: school   # same shared database as student-service
+      PORT: 3502
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ---- Microservice: Attendance ----
+  attendance-service:
+    container_name: attendance-service
+    build:
+      context: services/attendance-service
+    image: attendance-service-image
+    restart: always
+    ports:
+      - "3503:3503"
+    environment:
+      host: db
+      user: root
+      password: mysql123
+      database: school   # same shared database as the other services
+      PORT: 3503
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # ---- Microservice: Notification ----
+  notification-service:
+    container_name: notification-service
+    build:
+      context: services/notification-service
+    image: notification-service-image
+    restart: always
+    ports:
+      - "3504:3504"
+    environment:
+      host: db
+      user: root
+      password: mysql123
+      database: school   # same shared database as the other services
+      PORT: 3504
+    depends_on:
+      db:
+        condition: service_healthy
+
+  frontend:
+    container_name: frontend
+    build:
+      context: frontend/
+      args:
+        REACT_APP_API_BASE_URL: /api
+    image: frontend-image
+    restart: always
+    ports:
+      - "80:80"
+    depends_on:
+      - student-service
+      - teacher-service
+      - attendance-service
+      - notification-service
+    environment:
+      NODE_ENV: production
+
+volumes:
+  mysql-data:

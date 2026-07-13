@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teacher-service
+  namespace: student-teacher-portal
+  labels:
+    app: teacher-service
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: teacher-service
+  template:
+    metadata:
+      labels:
+        app: teacher-service
+    spec:
+      containers:
+        - name: teacher-service
+          image: <ECR_REPO_URI>/teacher-service:<IMAGE_TAG>   # replaced by CI/CD (Jenkins)
+          ports:
+            - containerPort: 3502
+          env:
+            - name: host
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: host
+            - name: user
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: user
+            - name: password
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: password
+            - name: database
+              valueFrom:
+                secretKeyRef:
+                  name: mysql-secret
+                  key: database
+            - name: PORT
+              value: "3502"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 3502
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 3502
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 300m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: teacher-service
+  namespace: student-teacher-portal
+spec:
+  selector:
+    app: teacher-service
+  ports:
+    - port: 3502
+      targetPort: 3502
+  type: ClusterIP
