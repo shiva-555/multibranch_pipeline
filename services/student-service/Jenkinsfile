@@ -18,17 +18,17 @@ pipeline {
     environment {
         SERVICE_NAME = 'student-service'
 
-        AWS_REGION = 'us-east-1'
+        AWS_REGION     = 'us-east-1'
         AWS_ACCOUNT_ID = '027742774373'
 
         ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-        ECR_REPO = "${ECR_REGISTRY}/${SERVICE_NAME}"
+        ECR_REPO     = "${ECR_REGISTRY}/${SERVICE_NAME}"
+
+        IMAGE_TAG = "${params.IMAGE_TAG?.trim() ?: env.BUILD_NUMBER}"
 
         EKS_CLUSTER = 'osp-labs-eks-cluster'
 
         GITOPS_REPO = 'https://github.com/shiva-555/osp-labs.git'
-
-        SERVICE_CHANGED = 'false'
     }
 
     stages {
@@ -46,6 +46,7 @@ pipeline {
                 AWS Region     : ${AWS_REGION}
                 AWS Account    : ${AWS_ACCOUNT_ID}
                 ECR Repository : ${ECR_REPO}
+                Image Tag      : ${IMAGE_TAG}
                 EKS Cluster    : ${EKS_CLUSTER}
                 GitOps Repo    : ${GITOPS_REPO}
 
@@ -60,77 +61,15 @@ pipeline {
             }
         }
 
-        stage('Detect Changes') {
-            steps {
-                script {
-
-                    def changedFiles = ""
-
-                    if (sh(
-                        script: "git rev-parse HEAD~1 >/dev/null 2>&1",
-                        returnStatus: true
-                    ) == 0) {
-
-                        changedFiles = sh(
-                            script: """
-                                git diff --name-only HEAD~1 HEAD |
-                                grep '^services/${SERVICE_NAME}/' || true
-                            """,
-                            returnStdout: true
-                        ).trim()
-
-                    } else {
-                        changedFiles = 'FIRST_BUILD'
-                    }
-
-                    if (changedFiles) {
-
-                        env.SERVICE_CHANGED = 'true'
-
-                        echo """
-                        ==========================================
-                        Changes detected for ${SERVICE_NAME}
-                        ==========================================
-
-                        ${changedFiles}
-
-                        ==========================================
-                        """
-
-                    } else {
-
-                        env.SERVICE_CHANGED = 'false'
-
-                        echo """
-                        ==========================================
-                        No changes detected for ${SERVICE_NAME}.
-                        Skipping CI stages.
-                        ==========================================
-                        """
-                    }
-                }
-            }
-        }
-
         stage('Install Dependencies') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
-
             steps {
                 dir("services/${SERVICE_NAME}") {
-                    sh '''
-                        npm ci
-                    '''
+                    sh 'npm ci'
                 }
             }
         }
 
         stage('Unit Test') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
-
             steps {
                 dir("services/${SERVICE_NAME}") {
                     echo "Unit tests are currently not enabled."
@@ -139,10 +78,6 @@ pipeline {
         }
 
         stage('Trivy Filesystem Scan') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
-
             steps {
                 dir("services/${SERVICE_NAME}") {
                     sh '''
@@ -156,15 +91,11 @@ pipeline {
         }
 
         stage('Docker Build') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
-
             steps {
                 dir("services/${SERVICE_NAME}") {
                     sh """
                         docker build \
-                            -t ${ECR_REPO}:${params.IMAGE_TAG?.trim() ?: env.BUILD_NUMBER} \
+                            -t ${ECR_REPO}:${IMAGE_TAG} \
                             .
                     """
                 }
@@ -172,25 +103,17 @@ pipeline {
         }
 
         stage('Docker Image Scan') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
-
             steps {
                 sh """
                     trivy image \
                         --severity HIGH,CRITICAL \
                         --exit-code 1 \
-                        ${ECR_REPO}:${params.IMAGE_TAG?.trim() ?: env.BUILD_NUMBER}
+                        ${ECR_REPO}:${IMAGE_TAG}
                 """
             }
         }
 
         stage('Docker Image Check') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
-
             steps {
                 sh """
                     docker images \
@@ -201,10 +124,6 @@ pipeline {
         }
 
         stage('ECR Login') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
-
             steps {
                 sh """
                     aws ecr get-login-password \
@@ -217,28 +136,20 @@ pipeline {
         }
 
         stage('Push Image to ECR') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
-
             steps {
                 sh """
                     docker push \
-                        ${ECR_REPO}:${params.IMAGE_TAG?.trim() ?: env.BUILD_NUMBER}
+                        ${ECR_REPO}:${IMAGE_TAG}
                 """
             }
         }
 
         stage('Verify ECR Image') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
-
             steps {
                 sh """
                     aws ecr describe-images \
                         --repository-name ${SERVICE_NAME} \
-                        --image-ids imageTag=${params.IMAGE_TAG?.trim() ?: env.BUILD_NUMBER} \
+                        --image-ids imageTag=${IMAGE_TAG} \
                         --region ${AWS_REGION}
                 """
             }
@@ -246,50 +157,30 @@ pipeline {
 
         stage('Summary') {
             steps {
-                script {
+                echo """
+                ==========================================
+                STUDENT SERVICE CI COMPLETED
+                ==========================================
 
-                    if (env.SERVICE_CHANGED == 'true') {
+                Service : ${SERVICE_NAME}
+                Image   : ${ECR_REPO}:${IMAGE_TAG}
+                ECR     : SUCCESS
 
-                        echo """
-                        ==========================================
-                        STUDENT SERVICE CI COMPLETED
-                        ==========================================
+                Next:
 
-                        Service       : ${SERVICE_NAME}
-                        Image         : ${ECR_REPO}:${params.IMAGE_TAG?.trim() ?: env.BUILD_NUMBER}
-                        ECR            : SUCCESS
+                ECR
+                 |
+                 v
+                GitOps Repository
+                 |
+                 v
+                ArgoCD
+                 |
+                 v
+                EKS
 
-                        Next:
-
-                        ECR
-                         |
-                         v
-                        GitOps Repository
-                         |
-                         v
-                        ArgoCD
-                         |
-                         v
-                        EKS
-
-                        ==========================================
-                        """
-
-                    } else {
-
-                        echo """
-                        ==========================================
-                        NO SERVICE CHANGES
-                        ==========================================
-
-                        ${SERVICE_NAME} was not modified.
-
-                        CI stages were skipped.
-
-                        ==========================================
-                        """
-                    }
-                }
+                ==========================================
+                """
             }
         }
     }
@@ -298,9 +189,9 @@ pipeline {
 
         always {
             sh """
-                docker rmi \
-                    ${ECR_REPO}:${params.IMAGE_TAG?.trim() ?: env.BUILD_NUMBER} \
-                    || true
+                docker image inspect ${ECR_REPO}:${IMAGE_TAG} >/dev/null 2>&1 &&
+                docker rmi ${ECR_REPO}:${IMAGE_TAG} ||
+                true
             """
         }
 
