@@ -1,7 +1,3 @@
-// Jenkinsfile for STUDENT-SERVICE
-// Used as a Multibranch Pipeline job with Script Path: services/student-service/Jenkinsfile
-// Only re-triggers meaningfully when this service's own folder changes (see "when" blocks).
-
 pipeline {
     agent any
 
@@ -11,17 +7,50 @@ pipeline {
         disableConcurrentBuilds()
     }
 
+    parameters {
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: '',
+            description: 'Optional Docker image tag. Leave empty to use Jenkins BUILD_NUMBER.'
+        )
+    }
+
     environment {
         SERVICE_NAME   = 'student-service'
         AWS_REGION     = 'us-east-1'
-        AWS_ACCOUNT_ID = '615299766984'
-        ECR_REPO       = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/dev/${SERVICE_NAME}"
-        IMAGE_TAG      = "${env.BRANCH_NAME}-${env.BUILD_NUMBER}"
-        EKS_CLUSTER    = 'three-tier-cluster'
-        K8S_NAMESPACE  = 'student-teacher-portal'
+        AWS_ACCOUNT_ID = '027742774373'
+
+        ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+        ECR_REPO     = "${ECR_REGISTRY}/${SERVICE_NAME}"
+
+        IMAGE_TAG = "${params.IMAGE_TAG?.trim() ?: env.BUILD_NUMBER}"
+
+        EKS_CLUSTER = 'osp-labs-eks-cluster'
+
+        GITOPS_REPO = 'https://github.com/shiva-555/osp-labs.git'
     }
 
     stages {
+
+        stage('Initialize') {
+            steps {
+                echo """
+                ==========================================
+                STUDENT SERVICE CI
+                ==========================================
+                Service        : ${SERVICE_NAME}
+                Branch         : ${BRANCH_NAME}
+                Build Number   : ${BUILD_NUMBER}
+                AWS Region     : ${AWS_REGION}
+                AWS Account    : ${AWS_ACCOUNT_ID}
+                ECR Repository : ${ECR_REPO}
+                Image Tag      : ${IMAGE_TAG}
+                EKS Cluster    : ${EKS_CLUSTER}
+                GitOps Repo    : ${GITOPS_REPO}
+                ==========================================
+                """
+            }
+        }
 
         stage('Checkout') {
             steps {
@@ -32,69 +61,205 @@ pipeline {
         stage('Detect Changes') {
             steps {
                 script {
-                    // Skip the rest of the pipeline if nothing under this service changed
-                    // (keeps the monorepo's multiple multibranch jobs from all rebuilding
-                    // on every commit). Always run on first build of a branch.
-                    def changed = sh(
-                        script: "git diff --name-only HEAD~1 HEAD 2>/dev/null | grep '^services/${SERVICE_NAME}/' || true",
+                    def changedFiles = sh(
+                        script: '''
+                            if git rev-parse HEAD~1 >/dev/null 2>&1; then
+                                git diff --name-only HEAD~1 HEAD |
+                                grep "^services/student-service/" || true
+                            else
+                                echo "FIRST_BUILD"
+                            fi
+                        ''',
                         returnStdout: true
                     ).trim()
-                    env.SERVICE_CHANGED = changed ? 'true' : 'true' // default true if diff unavailable (first build)
+
+                    if (changedFiles == 'FIRST_BUILD' || changedFiles) {
+                        env.SERVICE_CHANGED = 'true'
+
+                        echo """
+                        Changes detected in ${SERVICE_NAME}.
+
+                        Changed files:
+                        ${changedFiles}
+                        """
+                    } else {
+                        env.SERVICE_CHANGED = 'false'
+
+                        echo "No changes detected for ${SERVICE_NAME}."
+                    }
                 }
             }
         }
 
-        stage('Install & Test') {
+        stage('Install Dependencies') {
+            when {
+                environment name: 'SERVICE_CHANGED', value: 'true'
+            }
+
             steps {
                 dir("services/${SERVICE_NAME}") {
-                    sh 'npm install'
-                    // sh 'npm test'   // enable once real tests exist
+                    sh 'npm ci'
                 }
             }
         }
 
-        stage('Build Docker Image') {
+        stage('Unit Test') {
+            when {
+                environment name: 'SERVICE_CHANGED', value: 'true'
+            }
+
             steps {
                 dir("services/${SERVICE_NAME}") {
-                    sh "docker build -t ${ECR_REPO}:${IMAGE_TAG} ."
+                    echo "Unit tests are currently not enabled."
                 }
             }
         }
 
-        stage('Push to ECR') {
+        stage('Trivy Scan') {
+            when {
+                environment name: 'SERVICE_CHANGED', value: 'true'
+            }
+
+            steps {
+                dir("services/${SERVICE_NAME}") {
+                    sh '''
+                        trivy fs \
+                            --severity HIGH,CRITICAL \
+                            --exit-code 1 \
+                            .
+                    '''
+                }
+            }
+        }
+
+        stage('Docker Build') {
+            when {
+                environment name: 'SERVICE_CHANGED', value: 'true'
+            }
+
+            steps {
+                dir("services/${SERVICE_NAME}") {
+                    sh """
+                        docker build \
+                            -t ${ECR_REPO}:${IMAGE_TAG} \
+                            .
+                    """
+                }
+            }
+        }
+
+        stage('Docker Image Check') {
+            when {
+                environment name: 'SERVICE_CHANGED', value: 'true'
+            }
+
             steps {
                 sh """
-                    aws ecr get-login-password --region ${AWS_REGION} \
-                      | docker login --username AWS --password-stdin ${ECR_REPO}
-                    docker push ${ECR_REPO}:${IMAGE_TAG}
+                    docker images \
+                        ${ECR_REPO} \
+                        --format 'table {{.Repository}}\\t{{.Tag}}\\t{{.Size}}'
                 """
             }
         }
 
-        stage('Deploy to EKS') {
+        stage('ECR Login') {
             when {
-                anyOf { branch 'main'; branch 'master' }
+                environment name: 'SERVICE_CHANGED', value: 'true'
             }
+
             steps {
                 sh """
-                    aws eks update-kubeconfig --name ${EKS_CLUSTER} --region ${AWS_REGION}
-                    kubectl apply -f services/${SERVICE_NAME}/k8s/deployment.yaml -n ${K8S_NAMESPACE}
-                    kubectl set image deployment/${SERVICE_NAME} ${SERVICE_NAME}=${ECR_REPO}:${IMAGE_TAG} -n ${K8S_NAMESPACE}
-                    kubectl rollout status deployment/${SERVICE_NAME} -n ${K8S_NAMESPACE} --timeout=120s
+                    aws ecr get-login-password \
+                        --region ${AWS_REGION} |
+                    docker login \
+                        --username AWS \
+                        --password-stdin ${ECR_REGISTRY}
+                """
+            }
+        }
+
+        stage('Push Image to ECR') {
+            when {
+                environment name: 'SERVICE_CHANGED', value: 'true'
+            }
+
+            steps {
+                sh """
+                    docker push \
+                        ${ECR_REPO}:${IMAGE_TAG}
+                """
+            }
+        }
+
+        stage('Verify ECR Image') {
+            when {
+                environment name: 'SERVICE_CHANGED', value: 'true'
+            }
+
+            steps {
+                sh """
+                    aws ecr describe-images \
+                        --repository-name ${SERVICE_NAME} \
+                        --image-ids imageTag=${IMAGE_TAG} \
+                        --region ${AWS_REGION}
                 """
             }
         }
     }
 
     post {
+
         always {
-            sh "docker rmi ${ECR_REPO}:${IMAGE_TAG} || true"
+            sh """
+                docker rmi \
+                    ${ECR_REPO}:${IMAGE_TAG} \
+                    || true
+            """
         }
+
         success {
-            echo "✅ ${SERVICE_NAME} build ${IMAGE_TAG} deployed successfully."
+            echo """
+            ==========================================
+            PIPELINE SUCCESSFUL
+            ==========================================
+
+            Service : ${SERVICE_NAME}
+            Image   : ${ECR_REPO}:${IMAGE_TAG}
+
+            Docker image successfully built and
+            pushed to Amazon ECR.
+
+            CD flow:
+
+            Jenkins
+                |
+                v
+            GitOps Repository
+                |
+                v
+            ArgoCD
+                |
+                v
+            EKS
+
+            ==========================================
+            """
         }
+
         failure {
-            echo "❌ ${SERVICE_NAME} pipeline failed."
+            echo """
+            ==========================================
+            PIPELINE FAILED
+            ==========================================
+
+            Service      : ${SERVICE_NAME}
+            Build Number : ${BUILD_NUMBER}
+            Branch       : ${BRANCH_NAME}
+
+            Check the failed stage in Jenkins.
+
+            ==========================================
+            """
         }
     }
 }
