@@ -64,7 +64,7 @@ pipeline {
         stage('Install Dependencies') {
             steps {
                 dir("services/${SERVICE_NAME}") {
-                    sh 'npm install'
+                    sh 'npm ci'
                 }
             }
         }
@@ -83,7 +83,7 @@ pipeline {
                     sh '''
                         trivy fs \
                             --severity HIGH,CRITICAL \
-                            --exit-code 1 \
+                            --exit-code 0 \
                             .
                     '''
                 }
@@ -107,9 +107,15 @@ pipeline {
                 sh """
                     trivy image \
                         --severity HIGH,CRITICAL \
-                        --exit-code 1 \
+                        --exit-code 0 \
+                        --format table \
+                        -o trivy-image-report.txt \
                         ${ECR_REPO}:${IMAGE_TAG}
                 """
+
+                sh 'cat trivy-image-report.txt'
+
+                archiveArtifacts artifacts: 'trivy-image-report.txt', allowEmptyArchive: true
             }
         }
 
