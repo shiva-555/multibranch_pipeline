@@ -16,18 +16,19 @@ pipeline {
     }
 
     environment {
-        SERVICE_NAME   = 'student-service'
-        AWS_REGION     = 'us-east-1'
+        SERVICE_NAME = 'student-service'
+
+        AWS_REGION = 'us-east-1'
         AWS_ACCOUNT_ID = '027742774373'
 
         ECR_REGISTRY = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-        ECR_REPO     = "${ECR_REGISTRY}/${SERVICE_NAME}"
-
-        IMAGE_TAG = "${params.IMAGE_TAG?.trim() ?: env.BUILD_NUMBER}"
+        ECR_REPO = "${ECR_REGISTRY}/${SERVICE_NAME}"
 
         EKS_CLUSTER = 'osp-labs-eks-cluster'
 
         GITOPS_REPO = 'https://github.com/shiva-555/osp-labs.git'
+
+        SERVICE_CHANGED = 'false'
     }
 
     stages {
@@ -38,15 +39,16 @@ pipeline {
                 ==========================================
                 STUDENT SERVICE CI
                 ==========================================
+
                 Service        : ${SERVICE_NAME}
                 Branch         : ${BRANCH_NAME}
                 Build Number   : ${BUILD_NUMBER}
                 AWS Region     : ${AWS_REGION}
                 AWS Account    : ${AWS_ACCOUNT_ID}
                 ECR Repository : ${ECR_REPO}
-                Image Tag      : ${IMAGE_TAG}
                 EKS Cluster    : ${EKS_CLUSTER}
                 GitOps Repo    : ${GITOPS_REPO}
+
                 ==========================================
                 """
             }
@@ -61,31 +63,50 @@ pipeline {
         stage('Detect Changes') {
             steps {
                 script {
-                    def changedFiles = sh(
-                        script: '''
-                            if git rev-parse HEAD~1 >/dev/null 2>&1; then
-                                git diff --name-only HEAD~1 HEAD |
-                                grep "^services/student-service/" || true
-                            else
-                                echo "FIRST_BUILD"
-                            fi
-                        ''',
-                        returnStdout: true
-                    ).trim()
 
-                    if (changedFiles == 'FIRST_BUILD' || changedFiles) {
+                    def changedFiles = ""
+
+                    if (sh(
+                        script: "git rev-parse HEAD~1 >/dev/null 2>&1",
+                        returnStatus: true
+                    ) == 0) {
+
+                        changedFiles = sh(
+                            script: """
+                                git diff --name-only HEAD~1 HEAD |
+                                grep '^services/${SERVICE_NAME}/' || true
+                            """,
+                            returnStdout: true
+                        ).trim()
+
+                    } else {
+                        changedFiles = 'FIRST_BUILD'
+                    }
+
+                    if (changedFiles) {
+
                         env.SERVICE_CHANGED = 'true'
 
                         echo """
-                        Changes detected in ${SERVICE_NAME}.
+                        ==========================================
+                        Changes detected for ${SERVICE_NAME}
+                        ==========================================
 
-                        Changed files:
                         ${changedFiles}
+
+                        ==========================================
                         """
+
                     } else {
+
                         env.SERVICE_CHANGED = 'false'
 
-                        echo "No changes detected for ${SERVICE_NAME}."
+                        echo """
+                        ==========================================
+                        No changes detected for ${SERVICE_NAME}.
+                        Skipping CI stages.
+                        ==========================================
+                        """
                     }
                 }
             }
@@ -98,7 +119,9 @@ pipeline {
 
             steps {
                 dir("services/${SERVICE_NAME}") {
-                    sh 'npm ci'
+                    sh '''
+                        npm ci
+                    '''
                 }
             }
         }
@@ -115,7 +138,7 @@ pipeline {
             }
         }
 
-        stage('Trivy Scan') {
+        stage('Trivy Filesystem Scan') {
             when {
                 environment name: 'SERVICE_CHANGED', value: 'true'
             }
@@ -141,10 +164,25 @@ pipeline {
                 dir("services/${SERVICE_NAME}") {
                     sh """
                         docker build \
-                            -t ${ECR_REPO}:${IMAGE_TAG} \
+                            -t ${ECR_REPO}:${params.IMAGE_TAG?.trim() ?: env.BUILD_NUMBER} \
                             .
                     """
                 }
+            }
+        }
+
+        stage('Docker Image Scan') {
+            when {
+                environment name: 'SERVICE_CHANGED', value: 'true'
+            }
+
+            steps {
+                sh """
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 1 \
+                        ${ECR_REPO}:${params.IMAGE_TAG?.trim() ?: env.BUILD_NUMBER}
+                """
             }
         }
 
@@ -186,7 +224,7 @@ pipeline {
             steps {
                 sh """
                     docker push \
-                        ${ECR_REPO}:${IMAGE_TAG}
+                        ${ECR_REPO}:${params.IMAGE_TAG?.trim() ?: env.BUILD_NUMBER}
                 """
             }
         }
@@ -200,9 +238,58 @@ pipeline {
                 sh """
                     aws ecr describe-images \
                         --repository-name ${SERVICE_NAME} \
-                        --image-ids imageTag=${IMAGE_TAG} \
+                        --image-ids imageTag=${params.IMAGE_TAG?.trim() ?: env.BUILD_NUMBER} \
                         --region ${AWS_REGION}
                 """
+            }
+        }
+
+        stage('Summary') {
+            steps {
+                script {
+
+                    if (env.SERVICE_CHANGED == 'true') {
+
+                        echo """
+                        ==========================================
+                        STUDENT SERVICE CI COMPLETED
+                        ==========================================
+
+                        Service       : ${SERVICE_NAME}
+                        Image         : ${ECR_REPO}:${params.IMAGE_TAG?.trim() ?: env.BUILD_NUMBER}
+                        ECR            : SUCCESS
+
+                        Next:
+
+                        ECR
+                         |
+                         v
+                        GitOps Repository
+                         |
+                         v
+                        ArgoCD
+                         |
+                         v
+                        EKS
+
+                        ==========================================
+                        """
+
+                    } else {
+
+                        echo """
+                        ==========================================
+                        NO SERVICE CHANGES
+                        ==========================================
+
+                        ${SERVICE_NAME} was not modified.
+
+                        CI stages were skipped.
+
+                        ==========================================
+                        """
+                    }
+                }
             }
         }
     }
@@ -212,7 +299,7 @@ pipeline {
         always {
             sh """
                 docker rmi \
-                    ${ECR_REPO}:${IMAGE_TAG} \
+                    ${ECR_REPO}:${params.IMAGE_TAG?.trim() ?: env.BUILD_NUMBER} \
                     || true
             """
         }
@@ -223,24 +310,9 @@ pipeline {
             PIPELINE SUCCESSFUL
             ==========================================
 
-            Service : ${SERVICE_NAME}
-            Image   : ${ECR_REPO}:${IMAGE_TAG}
-
-            Docker image successfully built and
-            pushed to Amazon ECR.
-
-            CD flow:
-
-            Jenkins
-                |
-                v
-            GitOps Repository
-                |
-                v
-            ArgoCD
-                |
-                v
-            EKS
+            Service      : ${SERVICE_NAME}
+            Build Number : ${BUILD_NUMBER}
+            Branch       : ${BRANCH_NAME}
 
             ==========================================
             """
