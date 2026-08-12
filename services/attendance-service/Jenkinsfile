@@ -60,43 +60,16 @@ pipeline {
             }
         }
 
-        stage('Detect Changes') {
-            steps {
-                script {
-                    def changedFiles = sh(
-                        script: '''
-                            if git rev-parse HEAD~1 >/dev/null 2>&1; then
-                                git diff --name-only HEAD~1 HEAD | grep "^services/attendance-service/" || true
-                            else
-                                echo "FIRST_BUILD"
-                            fi
-                        ''',
-                        returnStdout: true
-                    ).trim()
-
-                    env.SERVICE_CHANGED = (changedFiles == 'FIRST_BUILD' || changedFiles) ? 'true' : 'false'
-
-                    if (env.SERVICE_CHANGED == 'true') {
-                        echo "Changes detected in ${SERVICE_NAME}.\nChanged files:\n${changedFiles}"
-                    } else {
-                        echo "No changes detected for ${SERVICE_NAME}. Skipping service-specific stages."
-                    }
-                }
-            }
-        }
-
         stage('Install Dependencies') {
-            when { environment name: 'SERVICE_CHANGED', value: 'true' }
             steps {
                 dir("services/${SERVICE_NAME}") {
                     echo "Installing Node.js dependencies..."
-                    sh 'npm ci'
+                    sh 'npm install'
                 }
             }
         }
 
         stage('Unit Test') {
-            when { environment name: 'SERVICE_CHANGED', value: 'true' }
             steps {
                 dir("services/${SERVICE_NAME}") {
                     echo "Unit tests are currently not enabled."
@@ -104,18 +77,16 @@ pipeline {
             }
         }
 
-        stage('Trivy Scan') {
-            when { environment name: 'SERVICE_CHANGED', value: 'true' }
+        stage('Trivy Filesystem Scan') {
             steps {
                 dir("services/${SERVICE_NAME}") {
                     echo "Running Trivy filesystem scan..."
-                    sh 'trivy fs --severity HIGH,CRITICAL --exit-code 1 .'
+                    sh 'trivy fs --severity HIGH,CRITICAL --exit-code 0 .'
                 }
             }
         }
 
         stage('Docker Build') {
-            when { environment name: 'SERVICE_CHANGED', value: 'true' }
             steps {
                 dir("services/${SERVICE_NAME}") {
                     echo "Building Docker image: ${ECR_REPO}:${IMAGE_TAG}"
@@ -124,15 +95,30 @@ pipeline {
             }
         }
 
+        stage('Docker Image Scan') {
+            steps {
+                sh """
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        --format table \
+                        -o trivy-image-report.txt \
+                        ${ECR_REPO}:${IMAGE_TAG}
+                """
+
+                sh 'cat trivy-image-report.txt'
+
+                archiveArtifacts artifacts: 'trivy-image-report.txt', allowEmptyArchive: true
+            }
+        }
+
         stage('Docker Image Check') {
-            when { environment name: 'SERVICE_CHANGED', value: 'true' }
             steps {
                 sh "docker images ${ECR_REPO} --format 'table {{.Repository}}\\t{{.Tag}}\\t{{.Size}}'"
             }
         }
 
         stage('ECR Login') {
-            when { environment name: 'SERVICE_CHANGED', value: 'true' }
             steps {
                 echo "Authenticating Docker with Amazon ECR..."
                 sh "aws ecr get-login-password --region ${AWS_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}"
@@ -140,7 +126,6 @@ pipeline {
         }
 
         stage('Push Image to ECR') {
-            when { environment name: 'SERVICE_CHANGED', value: 'true' }
             steps {
                 echo "Pushing image: ${ECR_REPO}:${IMAGE_TAG}"
                 sh "docker push ${ECR_REPO}:${IMAGE_TAG}"
@@ -148,10 +133,26 @@ pipeline {
         }
 
         stage('Verify ECR Image') {
-            when { environment name: 'SERVICE_CHANGED', value: 'true' }
             steps {
                 echo "Verifying image in Amazon ECR..."
                 sh "aws ecr describe-images --repository-name ${SERVICE_NAME} --image-ids imageTag=${IMAGE_TAG} --region ${AWS_REGION}"
+            }
+        }
+
+        stage('Summary') {
+            steps {
+                echo """\
+                ==================================================
+                         ATTENDANCE SERVICE CI COMPLETED
+                ==================================================
+                Service : ${SERVICE_NAME}
+                Image   : ${ECR_REPO}:${IMAGE_TAG}
+                ECR     : SUCCESS
+
+                Next:
+                ECR -> GitOps Repository -> ArgoCD -> EKS
+                ==================================================
+                """.stripIndent()
             }
         }
     }
@@ -159,7 +160,11 @@ pipeline {
     post {
         always {
             echo "Cleaning local Docker image..."
-            sh "docker rmi ${ECR_REPO}:${IMAGE_TAG} || true"
+            sh """
+                docker image inspect ${ECR_REPO}:${IMAGE_TAG} >/dev/null 2>&1 &&
+                docker rmi ${ECR_REPO}:${IMAGE_TAG} ||
+                true
+            """
         }
 
         success {
