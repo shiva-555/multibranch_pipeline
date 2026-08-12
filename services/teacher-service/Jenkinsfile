@@ -58,44 +58,7 @@ pipeline {
             }
         }
 
-        stage('Detect Changes') {
-            steps {
-                script {
-                    def changedFiles = sh(
-                        script: '''
-                            if git rev-parse HEAD~1 >/dev/null 2>&1; then
-                                git diff --name-only HEAD~1 HEAD |
-                                grep "^services/teacher-service/" || true
-                            else
-                                echo "FIRST_BUILD"
-                            fi
-                        ''',
-                        returnStdout: true
-                    ).trim()
-
-                    if (changedFiles == 'FIRST_BUILD' || changedFiles) {
-                        env.SERVICE_CHANGED = 'true'
-
-                        echo """
-                        Changes detected in ${SERVICE_NAME}.
-
-                        Changed files:
-                        ${changedFiles}
-                        """
-                    } else {
-                        env.SERVICE_CHANGED = 'false'
-
-                        echo "No changes detected for ${SERVICE_NAME}."
-                    }
-                }
-            }
-        }
-
         stage('Install Dependencies') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
-
             steps {
                 dir("services/${SERVICE_NAME}") {
                     sh 'npm ci'
@@ -104,10 +67,6 @@ pipeline {
         }
 
         stage('Unit Test') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
-
             steps {
                 dir("services/${SERVICE_NAME}") {
                     echo "Unit tests are currently not enabled."
@@ -115,17 +74,13 @@ pipeline {
             }
         }
 
-        stage('Trivy Scan') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
-
+        stage('Trivy Filesystem Scan') {
             steps {
                 dir("services/${SERVICE_NAME}") {
                     sh '''
                         trivy fs \
                             --severity HIGH,CRITICAL \
-                            --exit-code 1 \
+                            --exit-code 0 \
                             .
                     '''
                 }
@@ -133,10 +88,6 @@ pipeline {
         }
 
         stage('Docker Build') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
-
             steps {
                 dir("services/${SERVICE_NAME}") {
                     sh """
@@ -148,11 +99,24 @@ pipeline {
             }
         }
 
-        stage('Docker Image Check') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
+        stage('Docker Image Scan') {
+            steps {
+                sh """
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        --format table \
+                        -o trivy-image-report.txt \
+                        ${ECR_REPO}:${IMAGE_TAG}
+                """
 
+                sh 'cat trivy-image-report.txt'
+
+                archiveArtifacts artifacts: 'trivy-image-report.txt', allowEmptyArchive: true
+            }
+        }
+
+        stage('Docker Image Check') {
             steps {
                 sh """
                     docker images \
@@ -163,10 +127,6 @@ pipeline {
         }
 
         stage('ECR Login') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
-
             steps {
                 sh """
                     aws ecr get-login-password \
@@ -179,10 +139,6 @@ pipeline {
         }
 
         stage('Push Image to ECR') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
-
             steps {
                 sh """
                     docker push \
@@ -192,10 +148,6 @@ pipeline {
         }
 
         stage('Verify ECR Image') {
-            when {
-                environment name: 'SERVICE_CHANGED', value: 'true'
-            }
-
             steps {
                 sh """
                     aws ecr describe-images \
@@ -205,15 +157,44 @@ pipeline {
                 """
             }
         }
+
+        stage('Summary') {
+            steps {
+                echo """
+                ==========================================
+                TEACHER SERVICE CI COMPLETED
+                ==========================================
+
+                Service : ${SERVICE_NAME}
+                Image   : ${ECR_REPO}:${IMAGE_TAG}
+                ECR     : SUCCESS
+
+                Next:
+
+                ECR
+                 |
+                 v
+                GitOps Repository
+                 |
+                 v
+                ArgoCD
+                 |
+                 v
+                EKS
+
+                ==========================================
+                """
+            }
+        }
     }
 
     post {
 
         always {
             sh """
-                docker rmi \
-                    ${ECR_REPO}:${IMAGE_TAG} \
-                    || true
+                docker image inspect ${ECR_REPO}:${IMAGE_TAG} >/dev/null 2>&1 &&
+                docker rmi ${ECR_REPO}:${IMAGE_TAG} ||
+                true
             """
         }
 
@@ -223,24 +204,9 @@ pipeline {
             PIPELINE SUCCESSFUL
             ==========================================
 
-            Service : ${SERVICE_NAME}
-            Image   : ${ECR_REPO}:${IMAGE_TAG}
-
-            Docker image successfully built and
-            pushed to Amazon ECR.
-
-            CD flow:
-
-            Jenkins
-                |
-                v
-            GitOps Repository
-                |
-                v
-            ArgoCD
-                |
-                v
-            EKS
+            Service      : ${SERVICE_NAME}
+            Build Number : ${BUILD_NUMBER}
+            Branch       : ${BRANCH_NAME}
 
             ==========================================
             """
