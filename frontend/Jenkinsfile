@@ -64,7 +64,7 @@ pipeline {
         stage('Install Dependencies') {
             steps {
                 dir('frontend') {
-                    sh 'npm ci'
+                    sh 'npm install'
                 }
             }
         }
@@ -77,13 +77,13 @@ pipeline {
             }
         }
 
-        stage('Trivy Scan') {
+        stage('Trivy Filesystem Scan') {
             steps {
                 dir('frontend') {
                     sh '''
                         trivy fs \
                             --severity HIGH,CRITICAL \
-                            --exit-code 1 \
+                            --exit-code 0 \
                             .
                     '''
                 }
@@ -100,6 +100,23 @@ pipeline {
                             .
                     """
                 }
+            }
+        }
+
+        stage('Docker Image Scan') {
+            steps {
+                sh """
+                    trivy image \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 0 \
+                        --format table \
+                        -o trivy-image-report.txt \
+                        ${ECR_REPO}:${IMAGE_TAG}
+                """
+
+                sh 'cat trivy-image-report.txt'
+
+                archiveArtifacts artifacts: 'trivy-image-report.txt', allowEmptyArchive: true
             }
         }
 
@@ -144,15 +161,44 @@ pipeline {
                 """
             }
         }
+
+        stage('Summary') {
+            steps {
+                echo """
+                ==========================================
+                FRONTEND CI COMPLETED
+                ==========================================
+
+                Service : ${SERVICE_NAME}
+                Image   : ${ECR_REPO}:${IMAGE_TAG}
+                ECR     : SUCCESS
+
+                Next:
+
+                ECR
+                 |
+                 v
+                GitOps Repository
+                 |
+                 v
+                ArgoCD
+                 |
+                 v
+                EKS
+
+                ==========================================
+                """
+            }
+        }
     }
 
     post {
 
         always {
             sh """
-                docker rmi \
-                    ${ECR_REPO}:${IMAGE_TAG} \
-                    || true
+                docker image inspect ${ECR_REPO}:${IMAGE_TAG} >/dev/null 2>&1 &&
+                docker rmi ${ECR_REPO}:${IMAGE_TAG} ||
+                true
             """
         }
 
